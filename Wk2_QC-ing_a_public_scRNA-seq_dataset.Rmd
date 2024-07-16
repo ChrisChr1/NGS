@@ -1,0 +1,457 @@
+---
+title: "Week 2 Practicum: QC-ing a public 10X scRNA dataset"
+author: "BaDoi Phan"
+date: "2024-01-28"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+# Learning Objectives
+
+In this tutorial, we will take a public 10X scRNA-seq dataset from alignment
+through the QC metrics. We will use the `Seurat` package to perform the QC steps
+and visualize the QC metrics on a preliminary clustering of the data. Some of the
+functions will apply and gloss over concepts that we will cover in more detail in
+later weeks. Since QC is a critical step in every step of the analysis pipeline, 
+we will skip over explaining some of the functions and concepts in order to get
+to some of the QC applications along the breadth of the analysis pipeline
+
+By the end of this tutorial, we should be able to:
+- Create a `Seurat` object from multi-sample aggregated data
+- Inquire the sample-wise QC metrics of the data
+- Apply cell-wise and gene-wise QC filters
+- Visualize QC metrics on clustered data
+
+Dataset:
+[Multiomic Integration Neuroscience Application Note: Single Cell Multiome RNA + ATAC Alzheimer's Disease Mouse Model Brain Coronal Sections from One Hemisphere Over a Time Course](https://www.10xgenomics.com/datasets/multiomic-integration-neuroscience-application-note-single-cell-multiome-rna-atac-alzheimers-disease-mouse-model-brain-coronal-sections-from-one-hemisphere-over-a-time-course-1-standard)
+
+# Step 1: Load/Install the Required Packages
+
+Here, we introduce some new packages that we will use for QC-ing the data. Each 
+of these packages have corresponding webpages, publications, and other resources
+that go into more detail on how they work and how they compare to other methods.
+We will not go into detail on the methods, but will instead focus on the minimum 
+to get the data QC-ed and ready for downstream analysis.
+
+Packages for QC:
+- `scDblFinder`: Doublet detection
+- `MiQC`: Further mitochondrial QC metrics (optional)
+- `DropletQC`: Further low-quality cell QC metrics (optional)
+
+```{R load, message=FALSE, warning=FALSE}
+# for doublet detection
+if (!require("scDblFinder", quietly = TRUE))
+  BiocManager::install("scDblFinder")
+
+require("scDblFinder")
+
+require("SingleCellExperiment")
+require("Seurat")
+
+# for parallelization
+require("future")
+plan("multicore", workers = 4) # change this to half the number of cores you have
+
+if (!require("BiocParallel", quietly = TRUE))
+  BiocManager::install("BiocParallel")
+require("BiocParallel")
+options(MulticoreParam=MulticoreParam(workers=4))
+
+# Load packages for data manipulation and file path management
+require("here")
+require('tidyverse')
+```
+
+# Step 2: Load the Expression Data and Add Metadata
+
+We will load the expression data from the `CellRanger` counts matrix. We will 
+also add the metadata to help up QC the samples and cells.
+
+Note: this is the step where we can add the more advance _ambient RNA correction_
+with a package like `SoupX`. We will not do that here, but it is something to
+consider for your own data.
+
+```{R load_data, message=FALSE, warning=FALSE}
+# load counts
+counts_fn = here('Datasets', 'practicum2_data', 'filtered_feature_bc_matrix')
+dir.exists(counts_fn) 
+
+# because this data came from multiome, we have to change the code slightly
+# Read10X will read in both the RNA and ATAC counts matrices, 
+# we need to specify the modality as gene expression,
+counts = Read10X(data.dir = counts_fn)[["Gene Expression"]]
+counts[1:5, 1:5]
+
+# load metadata
+metadata_fn = here('Datasets', 'practicum2_data', 
+                   'Multiome_RNA_ATAC_Mouse_Brain_Alzheimers_AppNote_aggr.csv')
+meta = read.csv(metadata_fn) %>% 
+  # looking at the metdata with `View(meta)`, inspect the experimental conditions
+  # lets add a row number to keep track of the samples for later
+  mutate(Sample = 1:nrow(.), 
+         # we can see 3 age groups
+         Time.point = factor(Time.point, levels = c('2.5 months', '5.7 months', '13+ months')), 
+         # similarly, we can see 2 genotypes, lets arrange it so the wild type is first
+         Strain = factor(Strain, levels = c('Wild type', 'Transgenic')))
+head(meta)
+
+# load the post-alignment QC metrics
+alignQC_fn = here('Datasets', 'practicum2_data', 
+                  'Multiome_RNA_ATAC_Mouse_Brain_Alzheimers_AppNote_summary.csv')
+alignQC = read.csv(alignQC_fn)
+head(alignQC)
+
+alignQC = read.csv(alignQC_fn) %>% 
+  # the first 3 columns are true for all samples
+  pivot_longer(cols = -c(Sample.ID, Genome, Pipeline.version), 
+               names_to = 'Metric', values_to = 'Value') %>% 
+  # do some string manipulation to get the library ID and simplify the metric
+  mutate(library_id = str_split(Metric, '\\.\\.', simplify = TRUE)[,2], 
+         library_id = str_replace(library_id, '\\.', ''), 
+         Metric = str_split(Metric, '\\.\\.', simplify = TRUE)[,1]) %>% 
+  filter(library_id != '') %>% 
+  # pivot the data to wide format so one row is one sample
+  pivot_wider(names_from = Metric, values_from = Value) 
+head(alignQC)
+
+# finally, lets add the alignment QC to the metdata
+meta = inner_join(meta, alignQC, by = 'library_id') %>% 
+  # remove metric columns for ATAC data (we'll revisit this dataset in BIOF 556)
+  select(-starts_with('ATAC'), -starts_with('atac'))
+
+head(meta)
+
+# make the Seurat object, adding the cell-wise metadata
+# we use the Sample number from the cell barcode to match the metadata
+ind = str_split(colnames(counts), "-", simplify = TRUE)[,2] %>% as.numeric()
+meta.data = meta[match(ind, meta$Sample),] # one row per cell
+obj = CreateSeuratObject(counts = counts, meta.data = meta.data)
+obj
+
+# match sure the metadata align with the counts matrix cell barcode
+# if the matching is correct, this will be a diagonal matrix
+# check our work. this is where simple mistakes can happen and cause problems later
+table(str_split(Cells(obj), "-", simplify = TRUE)[,2], obj$Sample)
+
+# clean up, now we've create the seurat object, we can delete `counts`
+rm(counts); gc()
+```
+
+# Step 3: Explore the available post-alignment QC
+
+Make some sample-wise QC plots of the post-alignment QC metrics. We will use the 
+`meta` data frame to make the plots. This gives us an idea about the cohort at 
+the sample-level. 
+
+Based on the following plots, there will be some biases in the dataset, but there
+is no one sample that is completely out of line with the others. We will continue
+analysis of the full dataset.
+
+```{R alignQC, message=FALSE, warning=FALSE}
+# plot the % of cells per sample
+# it seems that "strain" has a batch effect in the number of cells collected 
+ggplot(meta, aes(x = library_id, y = `Number.of.cells`, fill = Strain)) + 
+  geom_bar(stat = 'identity') + coord_flip() +
+  facet_grid(Time.point~., scales = 'free_y') +
+  labs(x = 'Sample', y = 'Number of Cells')
+
+# plot the sequencing depth per sample
+# it looks like the sequencing depth per cell is similar across Strain, good
+# there is a slight batch effect by age of the sample
+ggplot(meta, aes(x = library_id, y = `GEX.Pre.normalization.high.quality.reads.per.cell`, fill = Strain)) + 
+  geom_bar(stat = 'identity') + coord_flip() +
+  facet_grid(Time.point~., scales = 'free_y') +
+  labs(x = 'Sample', y = 'Reads per Cells')
+```
+
+
+# Step 4: QC the Cells
+
+Add the mitochondrial QC metrics to the `obj` and then QC the cells. There are 
+several advanced QC methods that we will not cover here.
+
+Note: This is also the step where we can replace the "mitochondrial QC" metrics 
+with the more advanced `miQC` analysis. Similarly, we can replace the 
+"low-quality cell" metrics with the more advanced `DropletQC` analyses.  
+
+Note: This borrows concepts from [here](https://satijalab.org/seurat/articles/pbmc3k_tutorial).
+
+Note2: Please use better colors to plot discrete variables. Seurat even has a 
+function to do this for you: `DiscetePalette()`. Other options [here](https://satijalab.org/seurat/reference/discretepalette). Anyone who consistently 
+avoid using the default Seurat discrete color palette will get 1% added to their
+final course grade. Send me an email to remind me in the last week of class.
+
+```{R cellQC, message=FALSE, warning=FALSE}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+# add the mitochondrial QC metrics to the object
+# this dataset is from mouse, so we use the mouse genes pattern mt- instead of MT-
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+
+# we can separately add the ribosomal RNA QC metrics to the object
+# same issue here, we use the mouse genes pattern Rp[sl] instead of RPL/RPS
+obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^Rp[sl]")
+
+# we want Seurat to automatically group the samples by the sample name
+# we can set the Idents() to the `library_id`, to make it easier to plot
+# this will make it so the x axis of the QC plots will be pre-set to the `library_id`
+# change this to `Strain` or `Time.point` to see how the QC metrics vary by these
+Idents(obj) <- 'library_id'
+
+# pick a unique color for each sample
+cols = DiscretePalette(length(unique(obj$library_id)), 'polychrome')
+
+# plot all the cell-wise QC into a grid, dont plot each point
+# plot the distribution of the QC metrics across each sample
+VlnPlot(obj, features = 'nFeature_RNA', ncol = 1, pt.size = 0, cols = cols) + 
+  NoLegend() + ggtitle('Number of RNA Features')
+
+VlnPlot(obj, features = "nCount_RNA", ncol = 1, pt.size = 0, cols = cols) + 
+  NoLegend() + ggtitle('Number of UMIs per cells') + scale_y_log10()
+
+VlnPlot(obj, features = "percent.mt", ncol = 1,  pt.size = 0, cols = cols) + 
+  NoLegend() + ggtitle('Percent Mitochondrial Reads') + scale_y_log10()
+
+VlnPlot(obj, features = 'percent.ribo', ncol = 1, pt.size = 0, cols = cols) + 
+  NoLegend() + ggtitle('Percent Ribosomal Reads')
+```
+
+Looking at the plots, we can get an idea of where the average QC values for this
+dataset are and where the outliers are. This is a good place to start asking:
+
+- Does any sample look like it has grossly different QC metrics?
+- Are there any samples that have too many high percent of mitochondrial read cells?
+- What is the expected percent of mitochondrial reads in a nuclei vs. cell dataset?
+- What is the expected percent of ribosomal reads in a scRNA-seq dataset?
+- What threshold should we use to filter out low-quality cells? mito? ribo?
+
+Lets make some 2D dataset-wise plots to see if we can find any outliers. 
+
+```{R cellQC2, message=FALSE, warning=FALSE}
+
+# lets make a scatter plot of the QC metrics to see if using 2 together can
+# help use create combinatorial logic gate/filter to remove low-quality cells 
+# since Seurat under the hood uses ggplot2, we can use the ggplot2 syntax to
+# adjust the plot, such as using `facet_wrap` to make a grid of plots by sample
+# notice there are some cells w/ really low % mito reads, this looks artificial
+# otherwise, everythign looks like a big blob without clear outlier clusters
+plot1 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt", cols = cols) + 
+  NoLegend() + ggtitle('Number of UMIs per cells vs. Percent Mitochondrial Reads') + 
+  scale_y_log10() + scale_x_log10() + facet_wrap(~obj$library_id)
+plot1
+
+plot2 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", cols = cols) + 
+  NoLegend() + ggtitle('Number of UMIs per cells vs. Number of Genes per cells') + 
+  scale_y_log10() + scale_x_log10() + facet_wrap(~obj$library_id)
+plot2
+
+# lets see compared to the ribosomal reads
+plot3 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.ribo", cols = cols) + 
+  NoLegend() + ggtitle('Number of UMIs per cells vs. Percent Ribosomal Reads')+ 
+  scale_y_log10() + scale_x_log10() + facet_wrap(~obj$library_id)
+plot3
+
+# we can also make a plot of the ribosomal reads vs. the mitochondrial reads
+plot4 <- FeatureScatter(obj, feature1 = "percent.mt", feature2 = "percent.ribo", cols = cols) + 
+  NoLegend() + ggtitle('Percent Mitochondrial Readsvs. Percent Ribosomal Reads')+ 
+  scale_y_log10() + scale_x_log10() + facet_wrap(~obj$library_id)
+plot4
+```
+
+Looking at these scatterplots, split by sample, we don't have any clear outliers
+aside from the artifacitual low mito reads in some cells. Let's create these filters
+and apply them to the object. 
+
+```{R cellQC3, message=FALSE, warning=FALSE}
+# we can use the `subset` function to filter out cells based on QC metrics
+# some tutorials subset out cells with too many genes, but this is not a good
+# think about what too many genes means in the context of a single cell mean?
+# consider what is the goal of such a threshold?
+obj <- subset(obj, subset = nCount_RNA > 1000 & percent.mt > 1e-3 & 
+                percent.ribo < 1.5 & percent.ribo > 0.01)
+
+```
+
+# Step 5: Identify computationally likely doublets. 
+
+Doublets are cells that have two or more cells encapsulated in the same droplet.
+We will use the `scDblFinder` package to identify computationally likely doublets. 
+The concepts of how and why we do this will be covered later, but for now, we will
+just run the code to move to the next steps of QC-ing this dataset.
+
+Note: More information about the `scDblFinder` package can be found [here](https://plger.github.io/scDblFinder/)
+
+
+```{R dbl, message=FALSE, warning=FALSE}
+# this package requires an sce object, so we will convert our Seurat object
+sce = as.SingleCellExperiment(obj)
+colData(sce) # same metdata as the Seurat object
+
+# we need to tel scDblFinder which cells were run together (sample information)
+# we also pass TRUE to clusters, read the documentation and the paper to see why
+# this will take some time to run, so we will use the `MulticoreParam` to parallelize
+sce = scDblFinder(sce, clusters = TRUE, samples = 'library_id', 
+                   BPPARAM = MulticoreParam(4))
+colData(sce) # now the metadata has the doublet information in `scDblFinder.class`
+
+# let tabulate how many doublets were found in each sample
+table(sce$library_id, sce$scDblFinder.class)
+
+# as well as the % doublets for each sample
+prop.table(table(sce$library_id, sce$scDblFinder.class), 1) %>% signif(2) * 100 
+
+# lets add the doublet information back to the Seurat object
+all.equal(Cells(obj), colnames(sce)) # make sure the order is the same
+obj = AddMetaData(obj, sce$scDblFinder.class, col.name = 'scDblFinder.class')
+
+# at this point, we can filter out the doublets, but for demonstration, lets 
+# do that later and see how doublets affect the clustering and UMAP
+
+# clean up
+rm(sce); gc()
+```
+
+# Step 6: Standard `Seurat` workflow: normalization, scale, PCA, and UMAP
+
+Now that we have filtered out low-quality cells, we can proceed with the standard
+normalization, scaling, PCA, and UMAP steps. We will cover the concepts later, 
+but for now, we will just run the code to move to the next steps of QC-ing this
+dataset.
+
+Note: The "standard" `Seurat` workflow is just a collection of functions that
+are run in a specific order, described [here](https://satijalab.org/seurat/articles/essential_commands).
+This is run with default parameters, but we will cover the implications of these
+default parameters later, and when to change them.
+
+```{R norm, message=FALSE, warning=FALSE}
+# change the default future plan to use more memory for this analysis
+options(future.globals.maxSize = 20000 * 1024^2)
+options(future.rng.onMisuse = 'ignore')
+
+# the standard Seurat workflow
+obj <- NormalizeData(object = obj)
+obj <- FindVariableFeatures(object = obj)
+obj <- ScaleData(object = obj)
+obj <- RunPCA(object = obj)
+obj <- FindNeighbors(object = obj, dims = 1:30)
+obj <- FindClusters(object = obj)
+obj <- RunUMAP(object = obj, dims = 1:30)
+```
+
+# Step 7: QC the clustering 
+
+Now that we have run the standard `Seurat` workflow, we can look at the clustering
+of our QC-ed dataset. This entails plotting the QC metrics on the high-dimensional
+reduced clustering to see if any cell cluster is comprised of low-quality cells.
+
+```{R clusterQC, message=FALSE, warning=FALSE}
+# set the default palette to be the same as the cluster colors
+Idents(obj) = 'library_id'
+
+# lets start w/ plotting the experimental conditions on the UMAP to 
+DimPlot(obj, reduction = 'umap', label = TRUE, pt.size = 0.5, cols = cols) + 
+  NoLegend() + ggtitle('UMAP clustering of all the data')
+
+DimPlot(obj, reduction = 'umap', label = TRUE, pt.size = 0.5, cols = cols, 
+        split.by = 'Strain') + 
+  NoLegend() + ggtitle('UMAP clustering by Strain') 
+
+DimPlot(obj, reduction = 'umap', label = TRUE, pt.size = 0.5, cols = cols, 
+        split.by = 'Time.point') + 
+  NoLegend() + ggtitle('UMAP clustering by Time Point') 
+```
+
+Looking at these plots, we can see that the clustering is not specific to the 
+conditions. This is reassuring, since we would hope conditions like `age` and
+`transgene` would not fundamentally change the identity of cells in the brain.
+There may still be effects for certain genes, but this UMAP shows that there 
+isn't a global effect of these conditions on the transcriptome.
+
+Now lets' plot the QC metrics on the UMAP to see if any cluster is comprised of
+low-quality cells. 
+
+```{R clusterQC2, message=FALSE, warning=FALSE}
+# we can plot the per cell gene/UMI metrics on the UMAP
+to_plot = c('nCount_RNA', 'nFeature_RNA')
+FeaturePlot(obj, features = to_plot, pt.size = 0.5) & 
+  theme(legend.position = 'bottom')
+
+# the mito and ribo reads on the UMAP
+to_plot = c('percent.mt', 'percent.ribo')
+FeaturePlot(obj, features = to_plot, pt.size = 0.5) & 
+  theme(legend.position = 'bottom')
+```
+
+Based on these plots, there's no obvious cluster that is comprised of low-quality.
+On the UMAP, we can see some areas in each cluster has a higher % of ribosomal
+reads. This suggests that the % ribosomal reads is suggestive of other genes 
+effects that contribute to the clustering. This is more prominent than the % of
+mitochondrial reads, so % ribo is better in this dataset to use as a QC metric.
+
+Lets plot the "doublet" information on the UMAP to see if any cluster contains
+a lot of doublets.
+
+```{R clusterQC3, message=FALSE, warning=FALSE}
+DimPlot(obj, reduction = 'umap', label = TRUE, pt.size = 0.5, cols = c('gray', 'red'), 
+        group.by = 'scDblFinder.class') + 
+  NoLegend() + ggtitle('UMAP clustering by Doublet Status') 
+```
+
+Again here, we see that there are areas in each cluster that have a higher concentration
+of doublets. This suggests that the doublet status is suggestive of gene expression
+that contributes to the clustering. 
+
+# Step 8: Second round of filtering & re-run the standard `Seurat` workflow
+
+Together, we can now adjust our filtering criteria to remove cells that have relatively
+high % ribosomal reads and doublet status. After we remove these cells, we will
+re-run the standard `Seurat` workflow to remove the contribution of those genes 
+and cells from the clustering.
+
+```{R filter2, message=FALSE, warning=FALSE}
+# round 2 filtering with more stringent criteria, keep singlets
+obj <- subset(obj, subset = scDblFinder.class == 'singlet' & percent.ribo < 1)
+
+# the standard Seurat workflow
+# we don't need to re-run normalization, so this line is commented out
+# obj <- NormalizeData(object = obj)
+obj <- FindVariableFeatures(object = obj)
+obj <- ScaleData(object = obj)
+obj <- RunPCA(object = obj)
+obj <- FindNeighbors(object = obj, dims = 1:30)
+obj <- FindClusters(object = obj)
+obj <- RunUMAP(object = obj, dims = 1:30)
+
+```
+
+Lets replot our QC metrics on the UMAP to see if we how the clustering has changed.
+
+```{R clusterQC4, message=FALSE, warning=FALSE}
+# we can plot the per cell gene/UMI metrics on the UMAP
+to_plot = c('nCount_RNA', 'nFeature_RNA')
+FeaturePlot(obj, features = to_plot, pt.size = 0.5) & 
+  theme(legend.position = 'bottom')
+
+# the mito and ribo reads on the UMAP
+to_plot = c('percent.mt', 'percent.ribo')
+FeaturePlot(obj, features = to_plot, pt.size = 0.5) & 
+  theme(legend.position = 'bottom')
+```
+
+Based on these plots, we can see that the new higher % ribosomal reads is more
+spread out across the clusters. This suggests that the quality of the cells that
+remains is now more uniform across the clusters. We can now save our QC-ed dataset
+for downstream analysis.
+
+# Step 9: Save the QC-ed dataset
+
+```{R save, message=FALSE, warning=FALSE}
+# save the QC-ed dataset
+save_fn = here('Datasets', 'practicum2_data', 
+                   'Mouse_Brain_Alzheimers_RNA_postQC.seurat.rds')
+saveRDS(obj, save_fn)
+
+# once we've saved the QC-ed dataset, we can wipe our session clean so
+# we don't accidentally use the wrong data in the next R session
+rm(list = ls()); gc()
+```

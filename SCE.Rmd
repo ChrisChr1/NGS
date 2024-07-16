@@ -1,0 +1,69 @@
+---
+title: "SeuratData"
+output: html_document
+date: "2024-06-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Install packages and load in Seurat Data
+
+```{r}
+install.packages("Seurat")
+install.packages("SeuratObject")
+library(Seurat)
+library(SeuratObject)
+
+install.packages("BiocManager", quiet = TRUE)
+library(BiocManager)
+BiocManager::install("SingleCellExperiment")
+library(SingleCellExperiment)
+
+BiocManager::install("here")
+install.packages("tidyverse")
+library(here)
+library(tidyverse)
+
+
+devtools::install_github('satijalab/seurat-data')
+library(SeuratData)
+BiocManager::install("scRNAseq")
+library(scRNAseq)
+```
+
+```{r}
+out <- SeuratData::AvailableData()
+head(out)
+out[grep("pancrea", out$system, ignore.case = T),]
+
+InstallData("panc8")
+data("panc8")
+obj_panc <- UpdateSeuratObject(panc8)
+
+names(obj_panc[[]])
+table(obj_panc$orig.ident)
+table(obj_panc$tech) #five separate technologies used
+```
+
+### What cells should we expect to see in the pancreas?
+```{r}
+table(obj_panc$celltype) %>% sort(decreasing = T)
+```
+
+```{r}
+out <- scRNAseq::listDatasets() %>% as.data.frame()
+out[grep("pancreas", out$Part),]
+out[grep("pancreas", out$Part)[1],]$Call
+
+sce_panc <- BaronPancreasData("human")
+```
+
+```{r}
+sce_panc
+obj_panc2 <- as.Seurat(sce_panc, data = NULL) ## without data normalization, run data = NULL
+
+head(obj_panc[[]])
+```
+
